@@ -37,7 +37,7 @@ check("validate 通过", r.status_code == 200 and body["ok"] is True)
 check("validate 返回源表", len(body["source_tables"]) == 3)
 check("validate 返回模型依赖",
       {m["name"]: m["upstream"] for m in body["models"]}["ads_transfer_settlement"]
-      == ["dwd_card_transaction_detail", "dws_line_transfer_summary"])
+      == ["dws_line_transfer_summary"])
 
 # 分析
 r = client.post("/api/analyze?table=ods_card_transaction&column=transfer_flag", json=sample)
@@ -45,6 +45,10 @@ body = r.get_json()
 check("analyze 通过", r.status_code == 200 and body["ok"] is True)
 check("analyze 命中 3 模型", body["result"]["model_count"] == 3)
 check("analyze 命中 19 列", body["result"]["column_count"] == 19)
+ads = next(m for m in body["result"]["affected_models"]
+           if m["model"] == "ads_transfer_settlement")
+check("analyze 报出结算常量列",
+      "transfer_settlement_cnt" in {c["column"] for c in ads["columns"]})
 
 # 缺参数
 r = client.post("/api/analyze", json=sample)

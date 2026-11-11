@@ -535,10 +535,15 @@ function renderPath(path) {
     const arrow = i > 0 ? '<span class="arrow">→</span>' : "";
     const via = step.via ? `<span class="via ${step.via}">${step.via === "value" ? "值传递" : "条件"}</span>` : "";
     const pred = step.predicate ? `<span class="via condition">${escapeHtml(step.predicate)}</span>` : "";
+    const readSet = step.reads_result_set
+      ? `<span class="node-ref">读取结果集 ${escapeHtml(step.input_result_set)}</span>`
+      : `<span class="node-ref">${escapeHtml(step.input_relation)}.${escapeHtml(step.input_column)}</span>`;
+    const out = step.output
+      ? `<span class="arrow">→</span><span class="node-ref">${escapeHtml(step.output)}</span>`
+      : `<span class="arrow">→</span><span class="node-ref">（结果集）</span>`;
     return `<div class="path-step">${arrow}
       <span class="node-ref">${escapeHtml(step.model)} · ${escapeHtml(step.query)}</span>
-      <span class="node-ref">${escapeHtml(step.input_relation)}.${escapeHtml(step.input_column)}</span>
-      <span class="arrow">→</span><span class="node-ref">${escapeHtml(step.output)}</span>
+      ${readSet}${out}
       ${via}${pred}</div>`;
   }).join("") + `</div>`;
 }
@@ -558,7 +563,8 @@ function renderResult(r) {
     <div class="alert alert-info">
       <span>🎯</span>
       <span>起点字段：<b>${escapeHtml(r.target.table)}.${escapeHtml(r.target.column)}</b>。
-      字段进入 JOIN ON / WHERE（含 IN 子查询）时，该查询及其下游实际读取者的<b>全部输出列</b>按条件污染标出。</span>
+      字段进入 JOIN ON / WHERE（含 IN 子查询），或上游结果集被条件污染后被 FROM / INNER JOIN 读取时，
+      该查询及其下游实际读取者的<b>全部输出列</b>（含常量列）按条件污染标出。</span>
     </div>`;
 
   const cards = r.affected_models.map(m => `

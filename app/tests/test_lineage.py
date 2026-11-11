@@ -113,7 +113,8 @@ p = make_payload([
 r = analyze(p, "t_a", "flag")
 m = r["affected_models"][0]
 check("CTE条件-全部输出", {c["column"] for c in m["columns"]} == {"id", "flag"})
-check("CTE条件-条件查询标注", m["condition_queries"] == ["c1"])
+# CTE 自身命中 WHERE；主查询通过 FROM 读取该条件污染结果集，同样被标注
+check("CTE条件-条件查询标注", m["condition_queries"] == ["c1", "m1"])
 
 # 7. 多层 CTE 值传递链 ----------------------------------------------------------------
 p = make_payload([
@@ -361,6 +362,104 @@ check("diamond-汇合模型全列污染",
 check("diamond-路径均回源",
       all(c["path"][0]["type"] == "source" and c["path"][0]["column"] == "flag"
           for c in m5["columns"]))
+
+# 28. 上游结果集被条件污染：下游只读结果集、输出常量 1 也必须报出 ---------------------------
+p = make_payload([
+    {"name": "m1", "sql":
+     "SELECT a.id AS id, a.flag AS flag FROM t_a a WHERE a.flag = 1"},
+    {"name": "m2", "sql":
+     "SELECT x.id AS id, 1 AS const_col FROM m1 x"},
+])
+r = analyze(p, "t_a", "flag")
+m2 = next(m for m in r["affected_models"] if m["model"] == "m2")
+check("结果集读取-常量列被报出",
+      {c["column"] for c in m2["columns"]} == {"id", "const_col"},
+      str({c["column"] for c in m2["columns"]}))
+const_path = next(c for c in m2["columns"] if c["column"] == "const_col")["path"]
+check("结果集读取-常量列路径回源",
+      const_path[0]["type"] == "source" and const_path[0]["column"] == "flag")
+read_steps = [s for s in const_path if s.get("reads_result_set")]
+check("结果集读取-路径写明读取结果集",
+      len(read_steps) == 1
+      and read_steps[0]["input_result_set"] == "m1"
+      and "input_column" not in read_steps[0],
+      str(read_steps))
+
+# 29. 穿过 CTE 与多级模型，结果集条件污染不中断 ---------------------------------------------
+p = make_payload([
+    {"name": "m1", "sql":
+     "SELECT a.id AS id, a.flag AS flag FROM t_a a WHERE a.flag = 1"},
+    {"name": "m2", "sql":
+     "WITH c AS (SELECT x.id AS id, 1 AS c_const FROM m1 x) "
+     "SELECT c.id AS id, c.c_const AS c_const FROM c"},
+    {"name": "m3", "sql":
+     "SELECT y.c_const AS final_const, 1 AS const_only FROM m2 y"},
+])
+r = analyze(p, "t_a", "flag")
+m2 = next(m for m in r["affected_models"] if m["model"] == "m2")
+m3 = next(m for m in r["affected_models"] if m["model"] == "m3")
+check("CTE+多级-中间模型常量列被报出",
+      {c["column"] for c in m2["columns"]} == {"id", "c_const"})
+check("CTE+多级-下游仅读常量也被报出",
+      {c["column"] for c in m3["columns"]} == {"final_const", "const_only"})
+check("CTE+多级-常量路径回源",
+      next(c for c in m3["columns"] if c["column"] == "const_only")["path"][0]
+      == {"type": "source", "relation": "t_a", "column": "flag"})
+check("CTE+多级-读取结果集步骤命名上游模型",
+      any(s.get("reads_result_set") and s.get("input_result_set") == "m2"
+          for s in next(c for c in m3["columns"]
+                        if c["column"] == "const_only")["path"]))
+check("CTE+多级-列引用路径仍可回溯",
+      any(s.get("reads_result_set") and s.get("input_result_set") == "m1"
+          for s in next(c for c in m3["columns"]
+                        if c["column"] == "final_const")["path"]))
+
+# 30. 主查询没有直接/间接读取的 CTE，不牵连主查询 -------------------------------------------
+p = make_payload([
+    {"name": "m1", "sql": "SELECT a.id AS id, a.flag AS flag FROM t_a a"},
+    {"name": "m2", "sql":
+     "WITH ignored AS (SELECT a.id AS id, a.flag AS flag FROM t_a a WHERE a.flag = 1) "
+     "SELECT x.flag AS flag, x.id AS id FROM m1 x"},
+])
+r = analyze(p, "t_a", "flag")
+m2 = next(m for m in r["affected_models"] if m["model"] == "m2")
+check("未读取CTE-只按列引用传播",
+      {c["column"] for c in m2["columns"]} == {"flag"},
+      str({c["column"] for c in m2["columns"]}))
+check("未读取CTE-不标记条件污染", m2["condition_tainted"] is False)
+check("未读取CTE-条件查询为空", m2["condition_queries"] == [])
+
+# 31. 纯取值影响仍按列引用传播：上游结果集未被条件污染时，不扩散到常量/无关列 ---------------
+p = make_payload([
+    {"name": "m1", "sql": "SELECT a.id AS id, a.flag AS flag FROM t_a a"},
+    {"name": "m2", "sql":
+     "SELECT x.flag AS flag, 1 AS const_col, x.id AS id "
+     "FROM m1 x WHERE x.id > 0"},
+])
+r = analyze(p, "t_a", "flag")
+m2 = next(m for m in r["affected_models"] if m["model"] == "m2")
+check("纯取值-只命中列引用",
+      {c["column"] for c in m2["columns"]} == {"flag"},
+      str({c["column"] for c in m2["columns"]}))
+check("纯取值-非条件污染", m2["condition_tainted"] is False)
+
+# 32. 上游结果集被条件污染：INNER JOIN 读取也扩散到全部输出列 ------------------------------
+p = make_payload([
+    {"name": "m1", "sql":
+     "SELECT a.id AS id, a.flag AS flag, a.val AS val FROM t_a a WHERE a.flag = 1"},
+    {"name": "m2", "sql":
+     "SELECT x.id AS id, b.name AS name, 1 AS const_col "
+     "FROM m1 x INNER JOIN t_b b ON b.amt > 0"},
+])
+r = analyze(p, "t_a", "flag")
+m2 = next(m for m in r["affected_models"] if m["model"] == "m2")
+check("INNER JOIN读取-全部输出列",
+      {c["column"] for c in m2["columns"]} == {"id", "name", "const_col"},
+      str({c["column"] for c in m2["columns"]}))
+check("INNER JOIN读取-常量路径写明结果集",
+      any(s.get("input_result_set") == "m1"
+          for c in m2["columns"] for s in c["path"]
+          if c["column"] == "const_col"))
 
 print()
 if FAILURES:

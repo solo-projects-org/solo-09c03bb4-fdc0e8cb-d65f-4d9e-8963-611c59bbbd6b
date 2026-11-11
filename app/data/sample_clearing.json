@@ -1,5 +1,5 @@
 {
-  "scenario": "公交清分数仓 · 换乘标志(transfer_flag)口径调整影响分析样例",
+  "scenario": "公交清分数仓 · 换乘标志(transfer_flag)口径调整影响分析样例（含下游结算常量列漏报场景）",
   "source_tables": [
     {
       "table": "ods_card_transaction",
@@ -46,8 +46,8 @@
     },
     {
       "name": "ads_transfer_settlement",
-      "description": "换乘结算广告层：CTE 先筛换乘线路与公司维度，再关联明细并在 WHERE 中使用换乘标志",
-      "sql": "WITH line_txn AS (SELECT s.line_id AS line_id, s.line_name AS line_name, s.is_transfer AS is_transfer, s.txn_amount AS txn_amount FROM dws_line_transfer_summary s WHERE s.is_transfer = 'Y'), company_dim AS (SELECT l.line_id AS line_id, l.company_id AS company_id FROM dim_bus_line l) SELECT lt.line_id AS line_id, lt.line_name AS line_name, cd.company_id AS company_id, lt.is_transfer AS is_transfer, lt.txn_amount AS settlement_amount FROM line_txn lt INNER JOIN company_dim cd ON lt.line_id = cd.line_id INNER JOIN dwd_card_transaction_detail d ON lt.line_id = d.line_id WHERE d.transfer_flag = 1"
+      "description": "换乘结算层：按上游筛选后的结果集结算，为每条入选记录输出常量 1 作为结算笔数标志",
+      "sql": "SELECT s.line_id AS line_id, s.line_name AS line_name, s.is_transfer AS is_transfer, s.txn_amount AS settlement_amount, 1 AS transfer_settlement_cnt FROM dws_line_transfer_summary s"
     }
   ]
 }

@@ -74,6 +74,10 @@ class QueryNode:
     tainted_leaves: set[Leaf] = field(default_factory=set)
     # 运行期：被污染的输出列（值依赖或条件污染）
     tainted_outputs: set[str] = field(default_factory=set)
+    # 运行期：本查询的结果集（行集合）是否被条件污染。
+    # 与“某些输出列取值被污染”不同：一旦结果集被污染，任何实际
+    # FROM/INNER JOIN 读取该结果集的下游查询，其全部输出列都受影响。
+    result_set_tainted: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -144,10 +148,10 @@ def _resolve_column(col: exp.Column, scope, node: QueryNode, model_name: str) ->
             f"模型「{model_name}」的查询「{node.name}」中列「{col.name}」未带表名或别名，"
             "请为所有列引用补充限定名。"
         )
-    if qualifier not in scope.sources:
+    if qualifier not in scope.selected_sources:
         # 限定名既可能是拼写错误，也可能是关联子查询引用了外层作用域的别名
         outer = scope.parent
-        in_outer = outer is not None and qualifier in outer.sources
+        in_outer = outer is not None and qualifier in outer.selected_sources
         if in_outer:
             raise AnalysisError(
                 f"模型「{model_name}」的子查询「{node.name}」引用了外层查询的表/别名"
@@ -292,9 +296,12 @@ def _build_model(model_name: str, sql: str,
         if qname in by_name:
             raise AnalysisError(f"模型「{model_name}」中 CTE/子查询名「{qname}」重复。")
 
-        # 关系清单
+        # 关系清单：只取本查询 FROM/INNER JOIN 中真正读取的关系。
+        # scope.sources 还会包含 WITH 中未被主查询读取的 CTE，
+        # 这些 CTE 不能进入 sources，否则会错误牵连主查询。
         sources: dict[str, tuple[str, str]] = {}
-        for sname, source in scope.sources.items():
+        for sname in scope.selected_sources:
+            source = scope.sources[sname]
             if isinstance(source, exp.Table):
                 actual = source.name
                 if actual in model_names:
@@ -462,9 +469,11 @@ def build_models(payload: dict) -> tuple[dict[str, list[str]], dict[str, ModelIn
         if not isinstance(sql, str) or not sql.strip():
             raise AnalysisError(f"模型「{mname}」缺少非空 sql。")
         nodes, by_name = _build_model(mname, sql, source_schemas, model_names)
+        reachable = _reachable_ids(nodes, by_name)
         upstream = {
             actual
             for node in nodes
+            if node.node_id in reachable
             for stype, actual in node.sources.values()
             if stype == "model"
         }
@@ -520,17 +529,62 @@ def _topological_order(infos: dict[str, ModelInfo]) -> list[str]:
 # 污染传播
 # ---------------------------------------------------------------------------
 
+def _reachable_ids(nodes: list[QueryNode],
+                   by_name: dict[str, QueryNode]) -> set[str]:
+    """主查询（根查询）通过 FROM/INNER JOIN 或谓词子查询真正读取到的节点。
+
+    只有这些节点才可能影响模型结果；主查询没有直接或间接读取的 CTE
+    即使自身被污染，也不能牵连主查询。
+    """
+    by_id = {n.node_id: n for n in nodes}
+    reached: set[str] = set()
+    stack = [nodes[-1]]
+    while stack:
+        node = stack.pop()
+        if node.node_id in reached:
+            continue
+        reached.add(node.node_id)
+        for stype, actual in node.sources.values():
+            if stype in ("cte", "subquery") and actual in by_name:
+                stack.append(by_name[actual])
+        for sid in node.predicate_subqueries:
+            if sid in by_id:
+                stack.append(by_id[sid])
+    return reached
+
+
+def _reachable_node_ids(info: ModelInfo) -> set[str]:
+    return _reachable_ids(info.nodes, info.by_name)
+
+
 def _propagate_within_model(info: ModelInfo,
                             incoming: dict[str, set[str]],
-                            upstream_paths: dict[str, dict[str, list[dict]]]) -> dict[str, list[dict]]:
+                            upstream_paths: dict[str, dict[str, list[dict]]],
+                            upstream_condition_paths: dict[str, list[dict]],
+                            upstream_result_set_tainted: dict[str, bool]
+                            ) -> tuple[dict[str, list[dict]], list[dict] | None]:
     """在单个模型内部做定点传播。
 
-    incoming: 上游模型名 -> 被污染的上游输出列集合
+    incoming: 上游模型名 -> 上游被污染的输出列集合（仅保留本模型实际读取的列）
     upstream_paths: 上游模型根输出列 -> 完整依赖路径（用于跨模型串联）
-    返回：本模型根查询每个被污染输出列 -> 一条依赖路径
+    upstream_condition_paths: 上游模型名 -> 其根结果集被条件污染的一条路径
+    upstream_result_set_tainted: 上游模型名 -> 其根结果集是否被条件污染
+
+    返回：本模型根查询每个被污染输出列 -> 一条依赖路径，
+          以及根结果集被条件污染时的一条说明路径。
     """
     nodes = info.nodes  # traverse_scope 后序：被依赖的 CTE/子查询在前
     by_name = info.by_name
+    by_id = {n.node_id: n for n in nodes}
+    reachable = _reachable_node_ids(info)
+
+    def source_result_set_tainted(stype: str, actual: str) -> bool:
+        if stype == "model":
+            return upstream_result_set_tainted.get(actual, False)
+        if stype in ("cte", "subquery"):
+            up = by_name.get(actual)
+            return bool(up and up.result_set_tainted)
+        return False
 
     def seed_leaves(node: QueryNode) -> set[Leaf]:
         seeds: set[Leaf] = set()
@@ -541,38 +595,58 @@ def _propagate_within_model(info: ModelInfo,
         return seeds
 
     # 多轮定点：节点按后序排列，CTE/子查询间若存在引用链也可收敛
-    by_id = {n.node_id: n for n in nodes}
     for _ in range(len(nodes) + 1):
         changed = False
         for node in nodes:
-            before = (frozenset(node.tainted_leaves), frozenset(node.tainted_outputs))
+            if node.node_id not in reachable:
+                continue
+            before = (frozenset(node.tainted_leaves),
+                      frozenset(node.tainted_outputs),
+                      node.result_set_tainted)
 
-            # 1) 上游传入的污染叶子
+            # 1) 上游模型传入的污染叶子
             node.tainted_leaves |= seed_leaves(node)
 
-            # 2) 内部 CTE/子查询输出污染 -> 对应叶子污染
+            # 2) 内部 CTE/子查询输出污染 -> 对应叶子污染；
+            #    若上游结果集被条件污染，则其全部输出列都带污染
             for sname, (stype, actual) in node.sources.items():
                 if stype in ("cte", "subquery"):
                     up = by_name[actual]
                     for col in up.tainted_outputs:
                         node.tainted_leaves.add(Leaf(relation=sname, column=col))
 
-            # 3) 谓词子查询（IN (SELECT ...)）任一输出被污染 -> 条件命中
+            # 3) 谓词子查询（IN/EXISTS (SELECT ...)）任一输出被污染 -> 条件命中
             predicate_sub_hit = any(
-                bool(by_id[sid].tainted_outputs) for sid in node.predicate_subqueries
+                bool(by_id[sid].tainted_outputs)
+                or by_id[sid].result_set_tainted
+                for sid in node.predicate_subqueries
             )
-            condition_hit = bool(node.predicate_leaves & node.tainted_leaves) or predicate_sub_hit
+            # 4) 自身的 JOIN ON / WHERE 命中
+            own_condition_hit = (
+                bool(node.predicate_leaves & node.tainted_leaves)
+                or predicate_sub_hit
+            )
+            # 5) 读取了上游被条件污染的结果集：FROM/INNER JOIN 的行集合
+            #    已由受影响字段决定，因此本查询也被条件污染
+            source_condition_hit = any(
+                source_result_set_tainted(stype, actual)
+                for stype, actual in node.sources.values()
+            )
 
-            # 4) 值依赖传播
+            node.result_set_tainted = own_condition_hit or source_condition_hit
+
+            # 6) 值依赖传播：仍是列引用到输出列的关系
             for out_col, leaves in node.output_leaves.items():
                 if leaves & node.tainted_leaves:
                     node.tainted_outputs.add(out_col)
 
-            # 5) 条件污染：JOIN/WHERE/IN 子查询命中 -> 全部输出列
-            if condition_hit:
+            # 7) 条件污染：结果集受影响 -> 全部输出列
+            if node.result_set_tainted:
                 node.tainted_outputs.update(node.output_columns)
 
-            after = (frozenset(node.tainted_leaves), frozenset(node.tainted_outputs))
+            after = (frozenset(node.tainted_leaves),
+                     frozenset(node.tainted_outputs),
+                     node.result_set_tainted)
             if after != before:
                 changed = True
         if not changed:
@@ -581,95 +655,168 @@ def _propagate_within_model(info: ModelInfo,
         raise AnalysisError(f"模型「{info.name}」内部依赖无法收敛，请检查 CTE/子查询引用。")
 
     root = nodes[-1]
-    info.condition_tainted = any(
-        bool(n.predicate_leaves & n.tainted_leaves)
-        or any(by_id[sid].tainted_outputs for sid in n.predicate_subqueries)
-        for n in nodes
-    )
+    info.condition_tainted = root.result_set_tainted
 
     # 为每个污染输出列记录一条依赖路径
-    paths = _build_paths(info, upstream_paths)
-    return paths
+    paths, condition_path = _build_paths(
+        info, upstream_paths, upstream_condition_paths,
+        upstream_result_set_tainted, reachable,
+    )
+    return paths, condition_path
 
 
 def _build_paths(info: ModelInfo,
-                 upstream_paths: dict[str, dict[str, list[dict]]]) -> dict[str, list[dict]]:
+                 upstream_paths: dict[str, dict[str, list[dict]]],
+                 upstream_condition_paths: dict[str, list[dict]],
+                 upstream_result_set_tainted: dict[str, bool],
+                 reachable: set[str]
+                 ) -> tuple[dict[str, list[dict]], list[dict] | None]:
     """为根查询每个污染输出列构造一条回溯到源表字段的依赖路径。
 
     upstream_paths: 上游模型名 -> (该模型根输出列 -> 完整路径)。
     路径由“步骤”组成，每一步描述一个查询节点中 输入列 -> 输出列 的传递，
     via 标记该步是值依赖(value)还是条件污染(condition)。
+
+    若某一步只是读取了上游被条件污染的结果集（没有具体列引用），
+    该步用 reads_result_set / input_result_set 说明读了哪个结果集，
+    不再伪装成列引用。
     """
     by_name = info.by_name
     by_id = {n.node_id: n for n in info.nodes}
 
-    def find_path(node: QueryNode, col: str, seen: frozenset) -> list[dict] | None:
-        key = (node.node_id, col)
+    def source_result_set_tainted(stype: str, actual: str) -> bool:
+        if stype == "model":
+            return upstream_result_set_tainted.get(actual, False)
+        if stype in ("cte", "subquery"):
+            up = by_name.get(actual)
+            return bool(up and up.result_set_tainted and up.node_id in reachable)
+        return False
+
+    def leaf_base_path(stype: str, actual: str, leaf: Leaf,
+                       seen: frozenset) -> list[dict] | None:
+        if stype == "table":  # 源表：路径起点
+            return [{
+                "type": "source",
+                "relation": actual,
+                "column": leaf.column,
+            }]
+        if stype == "model":
+            return upstream_paths.get(actual, {}).get(leaf.column)
+        up = by_name[actual]
+        if leaf.column in up.tainted_outputs:
+            return find_output_path(up, leaf.column, seen)
+        return None
+
+    def find_condition_path(node: QueryNode, seen: frozenset,
+                            output: str | None = None) -> list[dict] | None:
+        """解释本查询结果集为何被条件污染，回到源表字段。
+
+        output 为最终输出列时，末步带上该输出列；作为上游中间路径时为空。
+        """
+        key = ("cond", node.node_id)
         if key in seen:
             return None
         seen = seen | {key}
+        base_fields = {"type": "node", "model": info.name, "query": node.name}
 
-        step = {
-            "type": "node",
-            "model": info.name,
-            "query": node.name,
-            "output": col,
-        }
-        cond_leaf_hit = bool(node.predicate_leaves & node.tainted_leaves)
-        value_leaves = [lf for lf in node.output_leaves[col] if lf in node.tainted_leaves]
-
-        # 优先值依赖，其次条件污染；保证路径反映真实的传递方式
-        ordered: list[tuple[Leaf, str]] = [(lf, "value") for lf in value_leaves]
-        if cond_leaf_hit:
-            for lf in sorted(node.predicate_leaves & node.tainted_leaves,
-                             key=lambda x: (x.relation, x.column)):
-                if not any(lf == v for v, _ in ordered):
-                    ordered.append((lf, "condition"))
-
-        for leaf, via in ordered:
+        # 1) 自身的 JOIN ON / WHERE 引用了被污染字段
+        for leaf in sorted(node.predicate_leaves & node.tainted_leaves,
+                           key=lambda x: (x.relation, x.column)):
             stype, actual = node.sources[leaf.relation]
-            cur = dict(step)
-            cur.update({
-                "via": via,
+            base = leaf_base_path(stype, actual, leaf, seen)
+            if base is None:
+                continue
+            step = dict(base_fields)
+            step.update({
+                "via": "condition",
                 "input_relation": actual,
                 "input_qualifier": leaf.relation,
                 "input_column": leaf.column,
+                "condition_target": "predicate",
             })
-            if stype in ("cte", "subquery"):
-                up = by_name[actual]
-                if leaf.column in up.tainted_outputs:
-                    sub = find_path(up, leaf.column, seen)
-                    if sub is not None:
-                        return sub + [cur]
-            elif stype == "model":
-                up_paths = upstream_paths.get(actual, {})
-                if leaf.column in up_paths:
-                    return up_paths[leaf.column] + [cur]
-            else:  # 源表：路径起点
-                return [{
-                    "type": "source",
-                    "relation": actual,
-                    "column": leaf.column,
-                }, cur]
+            if output is not None:
+                step["output"] = output
+            return base + [step]
 
-        # 条件污染经由 IN/EXISTS 谓词子查询：穿过子查询的任一污染输出
+        # 2) 条件经由 IN/EXISTS 谓词子查询命中
         for sid in node.predicate_subqueries:
             sub_node = by_id[sid]
+            if sub_node.node_id not in reachable:
+                continue
             pred_kind = "EXISTS" if sub_node.name.startswith("EXISTS") else "IN"
             for sub_col in sub_node.output_columns:
                 if sub_col not in sub_node.tainted_outputs:
                     continue
-                sub_path = find_path(sub_node, sub_col, seen)
-                if sub_path is not None:
-                    cur = dict(step)
-                    cur.update({
-                        "via": "condition",
-                        "input_relation": sub_node.name,
-                        "input_qualifier": sub_node.name,
-                        "input_column": sub_col,
-                        "predicate": pred_kind,
-                    })
-                    return sub_path + [cur]
+                sub_path = find_output_path(sub_node, sub_col, seen)
+                if sub_path is None:
+                    continue
+                step = dict(base_fields)
+                step.update({
+                    "via": "condition",
+                    "input_relation": sub_node.name,
+                    "input_qualifier": sub_node.name,
+                    "input_column": sub_col,
+                    "predicate": pred_kind,
+                    "condition_target": "predicate_subquery",
+                })
+                if output is not None:
+                    step["output"] = output
+                return sub_path + [step]
+
+        # 3) 只是读取了上游被条件污染的结果集（FROM/INNER JOIN）
+        for sname, (stype, actual) in node.sources.items():
+            if not source_result_set_tainted(stype, actual):
+                continue
+            if stype == "model":
+                up_path = upstream_condition_paths.get(actual)
+            else:
+                up_path = find_condition_path(by_name[actual], seen)
+            if up_path is None:
+                continue
+            step = dict(base_fields)
+            step.update({
+                "via": "condition",
+                "reads_result_set": True,
+                "input_relation": actual,
+                "input_qualifier": sname,
+                "input_result_set": actual,
+                "result_set_kind": stype,
+            })
+            if output is not None:
+                step["output"] = output
+            return up_path + [step]
+        return None
+
+    def find_output_path(node: QueryNode, col: str,
+                         seen: frozenset) -> list[dict] | None:
+        key = (node.node_id, col)
+        if key in seen:
+            return None
+        seen = seen | {key}
+        if col not in node.tainted_outputs:
+            return None
+
+        # 1) 优先值依赖：列引用 -> 输出列
+        for leaf in sorted(node.output_leaves.get(col, set()) & node.tainted_leaves,
+                           key=lambda x: (x.relation, x.column)):
+            stype, actual = node.sources[leaf.relation]
+            base = leaf_base_path(stype, actual, leaf, seen)
+            if base is None:
+                continue
+            return base + [{
+                "type": "node",
+                "model": info.name,
+                "query": node.name,
+                "output": col,
+                "via": "value",
+                "input_relation": actual,
+                "input_qualifier": leaf.relation,
+                "input_column": leaf.column,
+            }]
+
+        # 2) 条件污染（含读取上游污染结果集）：没有具体列引用也给出路径
+        if node.result_set_tainted:
+            return find_condition_path(node, seen, output=col)
         return None
 
     root = info.nodes[-1]
@@ -677,12 +824,16 @@ def _build_paths(info: ModelInfo,
     for col in root.output_columns:
         if col not in root.tainted_outputs:
             continue
-        path = find_path(root, col, frozenset())
+        path = find_output_path(root, col, frozenset())
         if path is None:
             path = [{"type": "node", "model": info.name, "query": root.name,
                      "output": col, "via": "unknown"}]
         result[col] = path
-    return result
+    condition_path = (
+        find_condition_path(root, frozenset())
+        if root.result_set_tainted else None
+    )
+    return result, condition_path
 
 
 def analyze(payload: dict, target_table: str, target_column: str) -> dict:
@@ -699,14 +850,19 @@ def analyze(payload: dict, target_table: str, target_column: str) -> dict:
     incoming: dict[str, dict[str, set[str]]] = {name: {} for name in infos}
     # 每个模型根输出列 -> 完整依赖路径（供下游模型串联）
     all_paths: dict[str, dict[str, list[dict]]] = {}
+    # 每个模型名 -> 其根结果集被条件污染的一条路径（供下游说明“读取了哪个结果集”）
+    all_condition_paths: dict[str, list[dict]] = {}
 
     for name in order:
         info = infos[name]
+        reachable = _reachable_node_ids(info)
         # 只保留真正被本模型读取的上游污染列
         for up in info.upstream:
             up_root = infos[up].nodes[-1]
             read_cols: set[str] = set()
             for node in info.nodes:
+                if node.node_id not in reachable:
+                    continue
                 for sname, (stype, actual) in node.sources.items():
                     if stype == "model" and actual == up:
                         all_leaves = set(node.predicate_leaves)
@@ -719,6 +875,8 @@ def analyze(payload: dict, target_table: str, target_column: str) -> dict:
 
         # 种子：目标源表字段被本模型直接读取，将污染注入真正读取该列的节点
         for node in info.nodes:
+            if node.node_id not in reachable:
+                continue
             for sname, (stype, actual) in node.sources.items():
                 if stype != "table" or actual != target_table:
                     continue
@@ -729,9 +887,17 @@ def analyze(payload: dict, target_table: str, target_column: str) -> dict:
                        for lf in all_leaves):
                     node.tainted_leaves.add(Leaf(relation=sname, column=target_column))
 
-        paths = _propagate_within_model(info, incoming[name], all_paths)
+        upstream_result_set_tainted = {
+            up: infos[up].condition_tainted for up in info.upstream
+        }
+        paths, condition_path = _propagate_within_model(
+            info, incoming[name], all_paths, all_condition_paths,
+            upstream_result_set_tainted,
+        )
         if paths:
             all_paths[name] = paths
+        if condition_path:
+            all_condition_paths[name] = condition_path
 
     affected = []
     for name in order:
@@ -750,12 +916,12 @@ def analyze(payload: dict, target_table: str, target_column: str) -> dict:
                 "via": via,
                 "path": path,
             })
-        # 条件污染判定（根查询或任一内部查询命中条件，含 IN 谓词子查询）
-        by_id = {n.node_id: n for n in info.nodes}
+        # 只有主查询直接/间接读取到的查询才算本模型的条件污染来源；
+        # 主查询没有读取的 CTE 即使自身命中条件，也不牵连主查询。
+        reachable = _reachable_node_ids(info)
         condition_queries = sorted({
             n.name for n in info.nodes
-            if (n.predicate_leaves & n.tainted_leaves)
-            or any(by_id[sid].tainted_outputs for sid in n.predicate_subqueries)
+            if n.node_id in reachable and n.result_set_tainted
         })
         affected.append({
             "model": name,
